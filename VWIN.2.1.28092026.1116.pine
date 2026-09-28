@@ -1,0 +1,153 @@
+// ═════════════════════════════════════════════════════════════════════════════
+// Author Name : Subhasom Mandal
+// GitHub      : https://github.com/Subhasom
+// Date        : Monday 28th Sep 2026
+// Release     : 2.1.28092026.1116
+// Description : VWIN — standalone V-Window (high-volatility windows, where ATR runs
+//               above its baseline, drawn as boxes with their high-low % move).
+// ═════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("VWIN", shorttitle = "VWIN", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpVW = "V-Window"
+vwOpen    = input.float(1.30, "Open when ATR > baseline x", minval = 0.5, step = 0.05, inline = "vw1", group = grpVW)
+vwClose   = input.float(1.05, "Fade below x",               minval = 0.5, step = 0.05, inline = "vw1", group = grpVW,
+     tooltip = "When ATR falls below this, the V-Window is extended rather than closed: it stays open until the kernel turns — falling for 2 consecutive bars if it was rising when the fade began, or turning back up if it was falling.")
+vwAtrLen  = input.int(14, "ATR Length",   minval = 1, inline = "vw2", group = grpVW)
+vwBaseLen = input.int(50, "Baseline EMA", minval = 1, inline = "vw2", group = grpVW)
+vwGaps    = input.bool(false, "Count session-open gaps", group = grpVW,
+     tooltip = "Off: the first bar of each session uses High - Low only, so an overnight gap cannot open a V-Window by itself.")
+winHiCol  = input.color(#ff5252, "High / fall", inline = "wbc", group = grpVW)
+winLoCol  = input.color(#26a69a, "Low / rise",  inline = "wbc", group = grpVW)
+
+grpK = "Kernel (window close)"
+src                = input.source(close, "Source", group = grpK,
+     tooltip = "The kernel is not drawn. It is used only to decide when an extended V-Window closes.")
+kH                 = input.int(8,      "Lookback Window",    minval = 3, inline = "k1", group = grpK)
+kR                 = input.float(8.0,  "Relative Weighting", minval = 0.25, step = 0.25, inline = "k1", group = grpK)
+kX                 = input.int(25,     "Regression Level",   minval = 2, maxval = 200, group = grpK)
+useKernelSmoothing = input.bool(false, "Enhance Kernel Smoothing", inline = "k2", group = grpK)
+kLag               = input.int(2,      "Lag", minval = 1, maxval = 5, inline = "k2", group = grpK)
+
+// ── Kernels ──────────────────────────────────────────────────────────────────
+kernelRQ(float s, int h, float r, int x) =>
+    var array<float> wts = array.new<float>()
+    var float den = 0.0
+    if wts.size() == 0
+        for i = 0 to x + 1
+            w = math.pow(1.0 + (i * i) / (2.0 * r * h * h), -r)
+            wts.push(w)
+            den += w
+    float num = 0.0
+    for i = 0 to x + 1
+        num += s[i] * wts.get(i)
+    num / den
+
+kernelGauss(float s, int h, int x) =>
+    var array<float> wts = array.new<float>()
+    var float den = 0.0
+    if wts.size() == 0
+        for i = 0 to x + 1
+            w = math.exp(-(i * i) / (2.0 * h * h))
+            wts.push(w)
+            den += w
+    float num = 0.0
+    for i = 0 to x + 1
+        num += s[i] * wts.get(i)
+    num / den
+
+// ── Volatility ratio ─────────────────────────────────────────────────────────
+vwTR    = not vwGaps and session.isfirstbar ? high - low : ta.tr(true)
+vwAtr   = ta.rma(vwTR, vwAtrLen)
+vwBase  = ta.ema(vwAtr, vwBaseLen)
+vwRatio = vwBase > 0 ? vwAtr / vwBase : na
+
+// ── Kernel direction ─────────────────────────────────────────────────────────
+yhat1       = kernelRQ(src, kH, kR, kX)
+yhat2       = kernelGauss(src, math.max(kH - kLag, 1), kX)
+kRateBull   = yhat1 > yhat1[1]
+kBullChange = kRateBull and yhat1[1] < yhat1[2]
+kColBull    = useKernelSmoothing ? yhat2 >= yhat1 : kRateBull
+
+// ── Window state ─────────────────────────────────────────────────────────────
+var bool inWin   = false
+var bool winExt  = false
+var bool extBear = false
+bool winOpened = false
+bool winClosed = false
+if not inWin
+    if vwRatio > vwOpen
+        inWin     := true
+        winExt    := false
+        winOpened := true
+else
+    if not winExt and not (vwRatio >= vwClose)
+        winExt  := true
+        extBear := not kColBull
+    if winExt
+        bool endBull = not extBear and not kColBull and not kColBull[1]
+        bool endBear = extBear and kBullChange
+        if endBull or endBear
+            inWin     := false
+            winExt    := false
+            winClosed := true
+
+// ── Drawing ──────────────────────────────────────────────────────────────────
+pctText(float a, float b) =>
+    float pc = (b - a) / a * 100
+    (pc >= 0 ? "+" : "") + str.tostring(pc, "0.00") + "%"
+
+swingText(float hi, float lo, int hiBar, int loBar) =>
+    "H/L " + (loBar < hiBar ? pctText(lo, hi) : pctText(hi, lo))
+
+var float wHi     = na
+var float wLo     = na
+var int   wHiBar  = na
+var int   wLoBar  = na
+var box   wBox    = na
+var label wHiLbl  = na
+var label wLoLbl  = na
+var label wPctLbl = na
+
+if winOpened
+    wHi     := high
+    wLo     := low
+    wHiBar  := bar_index
+    wLoBar  := bar_index
+    wBox    := box.new(bar_index, high, bar_index, low, border_color = color.new(#ffb74d, 20), border_style = line.style_dotted, bgcolor = color.new(#ffb74d, 100))
+    wHiLbl  := label.new(bar_index, high, "", style = label.style_label_down, color = winHiCol, textcolor = color.white, size = size.small)
+    wLoLbl  := label.new(bar_index, low,  "", style = label.style_label_up,   color = winLoCol, textcolor = color.white, size = size.small)
+    wPctLbl := label.new(bar_index, high, "", style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = winLoCol, size = size.small, textalign = text.align_left)
+else if inWin
+    if high > wHi
+        wHi    := high
+        wHiBar := bar_index
+    if low < wLo
+        wLo    := low
+        wLoBar := bar_index
+
+if (inWin and barstate.islast) or winClosed
+    if wHiBar == wLoBar and winClosed
+        if not na(wBox)
+            wBox.delete()
+            wHiLbl.delete()
+            wLoLbl.delete()
+            wPctLbl.delete()
+    else if not na(wBox)
+        int wRight = inWin ? bar_index : bar_index - 1
+        wBox.set_right(wRight)
+        wBox.set_top(wHi)
+        wBox.set_bottom(wLo)
+        wHiLbl.set_xy(wHiBar, wHi)
+        wHiLbl.set_text("H " + str.tostring(wHi, format.mintick))
+        wLoLbl.set_xy(wLoBar, wLo)
+        wLoLbl.set_text("L " + str.tostring(wLo, format.mintick))
+        wPctLbl.set_xy(wRight, wHi)
+        wPctLbl.set_text(swingText(wHi, wLo, wHiBar, wLoBar) + (inWin ? " (Open)" : ""))
+        wPctLbl.set_textcolor(wLoBar < wHiBar ? winLoCol : winHiCol)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(winOpened, "V-Window Open",  "VWIN ◧ V-Window Open {{ticker}} {{interval}}")
+alertcondition(winClosed, "V-Window Close", "VWIN ◨ V-Window Close (kernel turned) {{ticker}} {{interval}}")
